@@ -8,11 +8,21 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// skipOnWindows skips tests that assert POSIX-only semantics: permission
+// bits (Windows only models a read-only flag) and renaming open files.
+func skipOnWindows(t *testing.T, reason string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip(reason)
+	}
+}
 
 type fakeClock struct {
 	mu sync.Mutex
@@ -111,7 +121,7 @@ func TestNewCreatesFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("log file not created: %v", err)
 	}
-	if got := info.Mode().Perm(); got != 0o600 {
+	if got := info.Mode().Perm(); got != 0o600 && runtime.GOOS != "windows" {
 		t.Errorf("mode = %v, want 0600", got)
 	}
 	if w.Filename() != filepath.Clean(path) {
@@ -758,6 +768,7 @@ func TestCloseIdempotentAndWriteAfterClose(t *testing.T) {
 }
 
 func TestReopenAfterExternalMove(t *testing.T) {
+	skipOnWindows(t, "Windows cannot rename a file held open by the writer; external rotators are a unix workflow")
 	w, path, _ := newTestWriter(t)
 	mustWrite(t, w, "before")
 	moved := path + ".moved"
@@ -786,6 +797,7 @@ func TestSync(t *testing.T) {
 }
 
 func TestFileModeOption(t *testing.T) {
+	skipOnWindows(t, "POSIX permission bits are not meaningful on Windows")
 	umask := setUmask(0o027)
 	defer setUmask(umask)
 
@@ -801,6 +813,7 @@ func TestFileModeOption(t *testing.T) {
 }
 
 func TestRotationInheritsMode(t *testing.T) {
+	skipOnWindows(t, "POSIX permission bits are not meaningful on Windows")
 	path := filepath.Join(t.TempDir(), "app.log")
 	if err := os.WriteFile(path, []byte("x"), 0o640); err != nil {
 		t.Fatal(err)

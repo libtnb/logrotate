@@ -172,7 +172,8 @@ func WithBackupTimeFormat(layout string) Option {
 // WithFileMode sets the permission bits for newly created log files. The mode
 // is applied exactly, unaffected by the process umask. When unset, a new file
 // inherits the permissions of the file it replaces, or 0o600 if there is
-// none.
+// none. On Windows, which only models a read-only flag, non-writable modes
+// map to read-only and everything else is best-effort.
 func WithFileMode(mode fs.FileMode) Option {
 	return func(c *config) { c.fileMode = mode }
 }
