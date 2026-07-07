@@ -60,7 +60,7 @@ func newTestWriter(t *testing.T, opts ...Option) (*Writer, string, *fakeClock) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	t.Cleanup(func() { w.Close() })
+	t.Cleanup(func() { _ = w.Close() })
 	return w, path, clk
 }
 
@@ -115,7 +115,7 @@ func TestNewCreatesFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 
 	info, err := os.Stat(path)
 	if err != nil {
@@ -152,7 +152,7 @@ func TestNewValidation(t *testing.T) {
 	}
 	for name, mk := range cases {
 		if w, err := mk(); err == nil {
-			w.Close()
+			_ = w.Close()
 			t.Errorf("%s: New succeeded, want error", name)
 		}
 	}
@@ -165,7 +165,7 @@ func TestNewRejectsNonRegularFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	if w, err := New(target); err == nil {
-		w.Close()
+		_ = w.Close()
 		t.Fatal("New on a directory succeeded, want error")
 	}
 	// The mistake must not mutate the filesystem: no rename, no new file.
@@ -200,7 +200,7 @@ func TestNewAppendsToExistingFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	mustWrite(t, w, "+new")
 	if got := readFile(t, path); got != "old+new" {
 		t.Errorf("content = %q", got)
@@ -380,7 +380,7 @@ func TestRestartKeepsFileInSamePeriod(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	mustWrite(t, w, "-late")
 
 	if names := listDir(t, path); len(names) != 0 {
@@ -553,7 +553,7 @@ func TestCompress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	zr, err := gzip.NewReader(f)
 	if err != nil {
 		t.Fatalf("gzip.NewReader: %v", err)
@@ -586,8 +586,8 @@ func TestCompressFinishesInterruptedPass(t *testing.T) {
 	plain := filepath.Join(dir, "app-2026-03-14T09-00-00.000.log")
 	var zipped bytes.Buffer
 	zw := gzip.NewWriter(&zipped)
-	zw.Write([]byte("data"))
-	zw.Close()
+	_, _ = zw.Write([]byte("data"))
+	_ = zw.Close()
 	if err := os.WriteFile(plain, []byte("data"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -825,7 +825,7 @@ func TestRotationInheritsMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	if err := w.Rotate(); err != nil {
 		t.Fatal(err)
 	}
@@ -921,7 +921,7 @@ func BenchmarkRawFile(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	line := []byte(strings.Repeat("x", 127) + "\n")
 	b.SetBytes(int64(len(line)))
 	b.ResetTimer()
@@ -937,7 +937,7 @@ func BenchmarkWrite(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	line := []byte(strings.Repeat("x", 127) + "\n")
 	b.SetBytes(int64(len(line)))
 	b.ResetTimer()
@@ -954,7 +954,7 @@ func BenchmarkWriteWithTimeRotation(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	line := []byte(strings.Repeat("x", 127) + "\n")
 	b.SetBytes(int64(len(line)))
 	b.ResetTimer()
@@ -970,7 +970,7 @@ func BenchmarkWriteParallel(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	line := []byte(strings.Repeat("x", 127) + "\n")
 	b.SetBytes(int64(len(line)))
 	b.ResetTimer()

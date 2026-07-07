@@ -265,7 +265,7 @@ func (w *Writer) openNewLocked(prev os.FileInfo) error {
 	}
 	// O_CREATE modes are masked by the umask; restore the exact bits.
 	if err := file.Chmod(mode); err != nil {
-		file.Close()
+		_ = file.Close()
 		return fmt.Errorf("logrotate: set log file mode: %w", err)
 	}
 	if prev != nil {

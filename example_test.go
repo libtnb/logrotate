@@ -18,7 +18,7 @@ func Example() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 
 	log.SetOutput(w)
 	log.Println("application started")
@@ -41,7 +41,7 @@ func Example_production() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 
 	logger := slog.New(slog.NewJSONHandler(w, nil))
 	logger.Info("application started")
@@ -53,7 +53,7 @@ func ExampleWriter_Rotate() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	log.SetOutput(w)
 
 	hup := make(chan os.Signal, 1)
@@ -76,5 +76,5 @@ func ExampleWithCompressor() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 }

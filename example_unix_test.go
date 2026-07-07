@@ -21,7 +21,7 @@ func ExampleWriter_Reopen() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	log.SetOutput(w)
 
 	usr1 := make(chan os.Signal, 1)

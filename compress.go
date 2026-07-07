@@ -43,7 +43,7 @@ func (g GzipCompressor) Compress(dst io.Writer, src io.Reader) error {
 		return err
 	}
 	if _, err := io.Copy(zw, src); err != nil {
-		zw.Close()
+		_ = zw.Close()
 		return err
 	}
 	return zw.Close()
@@ -71,7 +71,7 @@ func (w *Writer) compressFile(src, dst string) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("logrotate: open backup: %w", err)
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 
 	tmp := dst + tmpSuffix
 	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, srcInfo.Mode().Perm())
@@ -79,8 +79,8 @@ func (w *Writer) compressFile(src, dst string) (int64, error) {
 		return 0, fmt.Errorf("logrotate: create archive: %w", err)
 	}
 	discard := func(err error) (int64, error) {
-		out.Close()
-		os.Remove(tmp)
+		_ = out.Close()
+		_ = os.Remove(tmp)
 		return 0, err
 	}
 	if err := out.Chmod(srcInfo.Mode().Perm()); err != nil {
@@ -93,18 +93,18 @@ func (w *Writer) compressFile(src, dst string) (int64, error) {
 		return discard(fmt.Errorf("logrotate: sync archive: %w", err))
 	}
 	if err := out.Close(); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return 0, fmt.Errorf("logrotate: close archive: %w", err)
 	}
 	if err := chown(tmp, srcInfo); err != nil {
 		w.cfg.reportError(fmt.Errorf("logrotate: preserve archive owner: %w", err))
 	}
 	if err := os.Rename(tmp, dst); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return 0, fmt.Errorf("logrotate: publish archive: %w", err)
 	}
 
-	in.Close() // Windows cannot remove an open file
+	_ = in.Close() // Windows cannot remove an open file
 	if err := os.Remove(src); err != nil {
 		return 0, fmt.Errorf("logrotate: remove backup after compression: %w", err)
 	}
