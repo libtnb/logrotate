@@ -3,6 +3,7 @@ package logrotate
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -98,14 +99,12 @@ func listDir(t *testing.T, path string) []string {
 	return names
 }
 
-// drainMill stops the writer and runs one synchronous maintenance pass so
-// tests can assert on final disk state deterministically.
+// drainMill stops the writer after its queued maintenance has completed.
 func drainMill(t *testing.T, w *Writer) {
 	t.Helper()
 	if err := w.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	w.millOnce()
 }
 
 func TestNewCreatesFile(t *testing.T) {
@@ -131,6 +130,8 @@ func TestNewCreatesFile(t *testing.T) {
 
 func TestNewValidation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "app.log")
+	var nilClock *fakeClock
+	var nilCompressor *failingCompressor
 	cases := map[string]func() (*Writer, error){
 		"empty filename":     func() (*Writer, error) { return New("") },
 		"negative max size":  func() (*Writer, error) { return New(path, WithMaxSize(-1)) },
@@ -141,8 +142,14 @@ func TestNewValidation(t *testing.T) {
 		"interval too large": func() (*Writer, error) { return New(path, WithRotateEvery(25*time.Hour)) },
 		"bad rotate-at":      func() (*Writer, error) { return New(path, WithRotateAt("24:00")) },
 		"nil location":       func() (*Writer, error) { return New(path, WithLocation(nil)) },
-		"bad time format":    func() (*Writer, error) { return New(path, WithBackupTimeFormat("2006/01/02")) },
-		"bad file mode":      func() (*Writer, error) { return New(path, WithFileMode(os.ModeSticky|0o600)) },
+		"nil option":         func() (*Writer, error) { return New(path, nil) },
+		"nil clock":          func() (*Writer, error) { return New(path, WithClock(nil)) },
+		"typed nil clock":    func() (*Writer, error) { return New(path, WithClock(nilClock)) },
+		"typed nil compressor": func() (*Writer, error) {
+			return New(path, WithCompressor(nilCompressor))
+		},
+		"bad time format": func() (*Writer, error) { return New(path, WithBackupTimeFormat("2006/01/02")) },
+		"bad file mode":   func() (*Writer, error) { return New(path, WithFileMode(os.ModeSticky|0o600)) },
 		"bad compressor ext": func() (*Writer, error) {
 			return New(path, WithCompressor(extCompressor{GzipCompressor{}, "gz"}))
 		},
@@ -571,6 +578,7 @@ func TestCompressCleansOrphanTmp(t *testing.T) {
 	if err := os.WriteFile(orphan, []byte("partial"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	w.requestMill()
 	drainMill(t, w)
 
 	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
@@ -594,6 +602,7 @@ func TestCompressFinishesInterruptedPass(t *testing.T) {
 	if err := os.WriteFile(plain+".gz", zipped.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	w.requestMill()
 	drainMill(t, w)
 
 	if _, err := os.Stat(plain); !os.IsNotExist(err) {
@@ -628,30 +637,123 @@ func (c extCompressor) Extension() string { return c.ext }
 
 type failingCompressor struct{}
 
-func (failingCompressor) Compress(io.Writer, io.Reader) error { return errors.New("boom") }
-func (failingCompressor) Extension() string                   { return ".fz" }
+func (failingCompressor) Compress(context.Context, io.Writer, io.Reader) error {
+	return errors.New("boom")
+}
+func (failingCompressor) Extension() string { return ".fz" }
 
 func TestErrorHandlerReceivesBackgroundErrors(t *testing.T) {
-	var mu sync.Mutex
-	var errs []error
-	handler := func(err error) { mu.Lock(); errs = append(errs, err); mu.Unlock() }
+	notified := make(chan error, 1)
+	handler := func(err error) { notified <- err }
 
 	w, path, _ := newTestWriter(t, WithCompressor(failingCompressor{}), WithErrorHandler(handler))
 	mustWrite(t, w, "payload")
 	if err := w.Rotate(); err != nil {
 		t.Fatal(err)
 	}
-	drainMill(t, w)
+	if err := w.Close(); err == nil || !strings.Contains(err.Error(), "compress backup: boom") {
+		t.Fatalf("Close error = %v, want retained compression failure", err)
+	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	if len(errs) == 0 {
-		t.Fatal("error handler never called for failed compression")
+	select {
+	case err := <-notified:
+		if !strings.Contains(err.Error(), "compress backup: boom") {
+			t.Errorf("handler error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("error handler never received the compression failure")
 	}
 	// The uncompressed backup must survive a failed compression.
 	names := listDir(t, path)
 	if len(names) != 1 || !strings.HasSuffix(names[0], ".log") {
 		t.Errorf("backups = %v, want the plain backup intact", names)
+	}
+}
+
+func TestErrorHandlerNeverRunsUnderWriterLock(t *testing.T) {
+	skipOnWindows(t, "removing an open file is a Unix-only test setup")
+
+	type handlerResult struct {
+		reported error
+		syncErr  error
+	}
+	handled := make(chan handlerResult, 1)
+	var w *Writer
+	handler := func(err error) {
+		handled <- handlerResult{reported: err, syncErr: w.Sync()}
+	}
+
+	var path string
+	w, path, _ = newTestWriter(t, WithMaxSize(1), WithErrorHandler(handler))
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	type writeResult struct {
+		n   int
+		err error
+	}
+	written := make(chan writeResult, 1)
+	go func() {
+		n, err := w.Write([]byte("x"))
+		written <- writeResult{n: n, err: err}
+	}()
+	select {
+	case result := <-written:
+		if result.n != 1 || result.err != nil {
+			t.Fatalf("Write = %d, %v; want 1, nil", result.n, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Write blocked in the error handler")
+	}
+
+	select {
+	case result := <-handled:
+		if result.syncErr != nil {
+			t.Errorf("handler Sync: %v", result.syncErr)
+		}
+		if !strings.Contains(result.reported.Error(), "not a regular file") {
+			t.Errorf("handler error = %v", result.reported)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("error handler was not called")
+	}
+
+	if err := w.Close(); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("Close error = %v, want retained rotation failure", err)
+	}
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestErrorHandlerCanShutdownWriter(t *testing.T) {
+	shutdown := make(chan error, 1)
+	var once sync.Once
+	var w *Writer
+	handler := func(error) {
+		once.Do(func() { shutdown <- w.Shutdown(context.Background()) })
+	}
+
+	w, _, _ = newTestWriter(t,
+		WithCompressor(failingCompressor{}),
+		WithErrorHandler(handler),
+	)
+	mustWrite(t, w, "payload")
+	if err := w.Rotate(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-shutdown:
+		if err == nil || !strings.Contains(err.Error(), "compress backup: boom") {
+			t.Fatalf("handler Shutdown error = %v, want retained compression failure", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("error handler deadlocked while shutting down the Writer")
 	}
 }
 
@@ -662,14 +764,9 @@ func TestErrorHandlerReceivesBackgroundErrors(t *testing.T) {
 // compression failure (full disk, broken compressor) defeat the one option
 // whose job is bounding disk usage.
 func TestMaxTotalSizeEnforcedWhenCompressionFails(t *testing.T) {
-	var mu sync.Mutex
-	var errs []error
-	handler := func(err error) { mu.Lock(); errs = append(errs, err); mu.Unlock() }
-
 	w, path, clk := newTestWriter(t,
 		WithCompressor(failingCompressor{}),
 		WithMaxTotalSize(250),
-		WithErrorHandler(handler),
 	)
 	for i := range 3 {
 		mustWrite(t, w, strings.Repeat(fmt.Sprint(i), 100))
@@ -678,7 +775,9 @@ func TestMaxTotalSizeEnforcedWhenCompressionFails(t *testing.T) {
 		}
 		clk.advance(time.Minute)
 	}
-	drainMill(t, w)
+	if err := w.Close(); err == nil || !strings.Contains(err.Error(), "compress backup: boom") {
+		t.Fatalf("Close error = %v, want retained compression failures", err)
+	}
 
 	names := listDir(t, path)
 	if len(names) != 2 {
@@ -688,11 +787,6 @@ func TestMaxTotalSizeEnforcedWhenCompressionFails(t *testing.T) {
 		if strings.HasSuffix(name, ".fz") {
 			t.Errorf("backup %s unexpectedly compressed", name)
 		}
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(errs) == 0 {
-		t.Error("compression failures were not reported")
 	}
 }
 
@@ -753,6 +847,11 @@ func TestCloseIdempotentAndWriteAfterClose(t *testing.T) {
 	if err := w.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := w.Shutdown(canceled); err != nil {
+		t.Fatalf("completed Shutdown with canceled context: %v", err)
+	}
 	if _, err := w.Write([]byte("y")); !errors.Is(err, ErrClosed) {
 		t.Errorf("Write after Close = %v, want ErrClosed", err)
 	}
@@ -762,8 +861,92 @@ func TestCloseIdempotentAndWriteAfterClose(t *testing.T) {
 	if err := w.Reopen(); !errors.Is(err, ErrClosed) {
 		t.Errorf("Reopen after Close = %v, want ErrClosed", err)
 	}
-	if err := w.Sync(); err != nil {
-		t.Errorf("Sync after Close = %v, want nil", err)
+	if err := w.Sync(); !errors.Is(err, ErrClosed) {
+		t.Errorf("Sync after Close = %v, want ErrClosed", err)
+	}
+}
+
+func TestShutdownRejectsNilContext(t *testing.T) {
+	w, _, _ := newTestWriter(t)
+	if err := w.Shutdown(nil); err == nil {
+		t.Fatal("Shutdown(nil) succeeded")
+	}
+}
+
+type delayedCancelCompressor struct {
+	started  chan struct{}
+	canceled chan struct{}
+	release  chan struct{}
+}
+
+func (c *delayedCancelCompressor) Compress(ctx context.Context, _ io.Writer, _ io.Reader) error {
+	close(c.started)
+	<-ctx.Done()
+	close(c.canceled)
+	<-c.release
+	return context.Cause(ctx)
+}
+
+func (*delayedCancelCompressor) Extension() string { return ".blocked" }
+
+func TestShutdown_CancelThenWaitAgain(t *testing.T) {
+	compressor := &delayedCancelCompressor{
+		started:  make(chan struct{}),
+		canceled: make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	w, _, _ := newTestWriter(t, WithCompressor(compressor))
+	mustWrite(t, w, "payload")
+	if err := w.Rotate(); err != nil {
+		t.Fatal(err)
+	}
+	<-compressor.started
+
+	shutdownCause := errors.New("shutdown deadline")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- w.Shutdown(ctx) }()
+	cancel(shutdownCause)
+	if err := <-firstDone; !errors.Is(err, shutdownCause) {
+		t.Fatalf("first Shutdown error = %v", err)
+	}
+	<-compressor.canceled
+
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- w.Shutdown(context.Background()) }()
+	select {
+	case err := <-secondDone:
+		t.Fatalf("second Shutdown returned before maintenance exited: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(compressor.release)
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second Shutdown error = %v", err)
+	}
+}
+
+func TestGzipCompressor_ObservesCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cause := errors.New("stop compression")
+	cancel(cause)
+	var dst bytes.Buffer
+	err := (GzipCompressor{}).Compress(ctx, &dst, strings.NewReader(strings.Repeat("x", 1024)))
+	if !errors.Is(err, cause) {
+		t.Fatalf("Compress error = %v", err)
+	}
+}
+
+func TestErrorHandlerPanicIsContained(t *testing.T) {
+	w, _, _ := newTestWriter(t,
+		WithCompressor(failingCompressor{}),
+		WithErrorHandler(func(error) { panic("handler panic") }),
+	)
+	mustWrite(t, w, "payload")
+	if err := w.Rotate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err == nil || !strings.Contains(err.Error(), "compress backup: boom") {
+		t.Fatalf("Close error = %v, want retained compression failure", err)
 	}
 }
 

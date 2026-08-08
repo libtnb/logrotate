@@ -1,6 +1,7 @@
 package logrotate
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -10,24 +11,12 @@ import (
 	"time"
 )
 
-// ErrClosed is returned by Write, Rotate and Reopen after Close.
+// ErrClosed is returned by Write, Sync, Rotate and Reopen after shutdown starts.
 var ErrClosed = errors.New("logrotate: writer is closed")
 
-// Writer is a rotating file writer implementing io.WriteCloser.
-//
-// The file given to New is always the active log file; rotation renames it to
-// a backup in the same directory ("name-<timestamp>.ext", plus a ".<n>"
-// sequence on collision and the compressor extension once compressed) and
-// reopens the original path, so external tools can rely on a stable name.
-// Rotation happens when the file reaches its size limit, when a wall-clock
-// boundary configured via WithRotateEvery or WithRotateAt has passed, or on
-// an explicit Rotate call. Compression and retention (WithMaxBackups,
-// WithMaxAge, WithMaxTotalSize) run on a single background goroutine and
-// never block writes.
-//
-// A Writer is safe for concurrent use by multiple goroutines. Like all
-// single-writer rotation schemes, it assumes it is the only process writing
-// to the file.
+// Writer rotates one active log file while keeping its path stable.
+// Compression and retention run on a background goroutine. Writer is safe for
+// concurrent goroutines but assumes one process owns the file.
 type Writer struct {
 	cfg      config
 	filename string
@@ -42,25 +31,30 @@ type Writer struct {
 	nextRotate time.Time // earliest upcoming time boundary; zero when disabled
 	closed     bool
 
-	millCh chan struct{}
-	millWG sync.WaitGroup
+	millCh     chan struct{}
+	millCtx    context.Context
+	millCancel context.CancelCauseFunc
+	millDone   chan struct{}
+	errors     *errorState
+
+	shutdownOnce sync.Once
+	shutdownErr  error
 }
 
 var _ io.WriteCloser = (*Writer)(nil)
 
-// New creates a Writer appending to filename, creating the file and any
-// missing parent directories on the spot so configuration or permission
-// problems surface here rather than at the first log record.
-//
-// If time-based rotation is configured and filename already exists, the
-// current rotation period is recovered from the file's modification time; a
-// leftover file last written in a previous period is rotated out immediately.
+// New opens filename for append and creates missing parent directories.
+// It validates all options and rotates an existing file immediately when its
+// modification time belongs to an expired schedule period.
 func New(filename string, opts ...Option) (*Writer, error) {
 	if filename == "" {
 		return nil, errors.New("logrotate: filename is required")
 	}
 	cfg := defaultConfig()
 	for _, opt := range opts {
+		if opt == nil {
+			return nil, errors.New("logrotate: nil option")
+		}
 		opt(&cfg)
 	}
 	if err := cfg.validate(); err != nil {
@@ -73,14 +67,19 @@ func New(filename string, opts ...Option) (*Writer, error) {
 		return nil, fmt.Errorf("logrotate: invalid filename %q", filename)
 	}
 	ext := filepath.Ext(base)
+	millCtx, millCancel := context.WithCancelCause(context.Background())
 	w := &Writer{
-		cfg:      cfg,
-		filename: filename,
-		dir:      filepath.Dir(filename),
-		prefix:   base[:len(base)-len(ext)] + "-",
-		ext:      ext,
-		zipExts:  []string{".gz"},
-		millCh:   make(chan struct{}, 1),
+		cfg:        cfg,
+		filename:   filename,
+		dir:        filepath.Dir(filename),
+		prefix:     base[:len(base)-len(ext)] + "-",
+		ext:        ext,
+		zipExts:    []string{".gz"},
+		millCh:     make(chan struct{}, 1),
+		millCtx:    millCtx,
+		millCancel: millCancel,
+		millDone:   make(chan struct{}),
+		errors:     newErrorState(cfg.errorHandler),
 	}
 	if cfg.compressor != nil {
 		if e := cfg.compressor.Extension(); e != ".gz" {
@@ -95,16 +94,14 @@ func New(filename string, opts ...Option) (*Writer, error) {
 		return nil, err
 	}
 
-	w.millWG.Add(1)
+	w.errors.start()
 	go w.millLoop()
 	w.requestMill() // clean up leftovers from previous runs
 	return w, nil
 }
 
-// Write implements io.Writer. It performs any due rotation, then writes p in
-// full to the active file. Writes never trigger compression or retention work
-// synchronously.
-func (w *Writer) Write(p []byte) (n int, err error) {
+// Write rotates when due, then writes p in full. Maintenance stays asynchronous.
+func (w *Writer) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
@@ -133,7 +130,7 @@ func (w *Writer) Write(p []byte) (n int, err error) {
 		}
 	}
 
-	n, err = w.file.Write(p)
+	n, err := w.file.Write(p)
 	w.size += int64(n)
 
 	if err == nil && w.cfg.maxSize > 0 && w.size >= w.cfg.maxSize {
@@ -142,37 +139,65 @@ func (w *Writer) Write(p []byte) (n int, err error) {
 		// succeeded, so a rotation failure must not be returned as a write
 		// failure — report it and retry on the next write.
 		if rerr := w.rotateLocked(w.cfg.clock.Now()); rerr != nil {
-			w.cfg.reportError(rerr)
+			w.reportError(rerr)
 		}
 	}
 	return n, err
 }
 
-// Close closes the active file and stops the background maintenance
-// goroutine, waiting for in-flight compression or cleanup to finish. Close is
-// idempotent. After Close, Write returns ErrClosed.
+// Close idempotently waits for maintenance without a deadline and returns any
+// retained maintenance errors.
 func (w *Writer) Close() error {
-	w.mu.Lock()
-	if w.closed {
-		w.mu.Unlock()
-		return nil
-	}
-	w.closed = true
-	err := w.closeFileLocked()
-	w.mu.Unlock()
+	return w.Shutdown(context.Background())
+}
 
-	// No rotation can signal the mill anymore: every sender checks w.closed
-	// under w.mu before sending.
-	close(w.millCh)
-	w.millWG.Wait()
-	return err
+// Shutdown closes the active file and waits for background maintenance. Its
+// result joins the active-file close error with a bounded record of maintenance
+// errors. When ctx expires, in-flight compression is cancelled and the result
+// also includes the context cause. A later call may keep waiting.
+func (w *Writer) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("logrotate: nil shutdown context")
+	}
+	w.shutdownOnce.Do(func() {
+		w.mu.Lock()
+		w.closed = true
+		w.shutdownErr = w.closeFileLocked()
+		w.mu.Unlock()
+		close(w.millCh)
+	})
+	select {
+	case <-w.millDone:
+		return w.finishShutdown()
+	default:
+	}
+
+	stopCancel := context.AfterFunc(ctx, func() {
+		w.millCancel(context.Cause(ctx))
+	})
+	defer stopCancel()
+	select {
+	case <-w.millDone:
+		return w.finishShutdown()
+	case <-ctx.Done():
+		select {
+		case <-w.millDone:
+			return w.finishShutdown()
+		default:
+		}
+		w.millCancel(context.Cause(ctx))
+		return errors.Join(context.Cause(ctx), w.errors.err())
+	}
 }
 
 // Sync flushes the active file to stable storage, satisfying
-// zapcore.WriteSyncer. It is a no-op when no file is open.
+// zapcore.WriteSyncer.
 func (w *Writer) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.closed {
+		return ErrClosed
+	}
 	if w.file == nil {
 		return nil
 	}
@@ -210,10 +235,12 @@ func (w *Writer) Reopen() error {
 // Filename returns the cleaned path of the active log file.
 func (w *Writer) Filename() string { return w.filename }
 
-// openExistingOrNewLocked opens the log file for appending, creating it if
-// absent. When time-based rotation is enabled and the existing file was last
-// written in a previous period, it is rotated out first so stale content
-// never receives new records.
+func (w *Writer) finishShutdown() error {
+	w.errors.close()
+	return errors.Join(w.shutdownErr, w.errors.err())
+}
+
+// openExistingOrNewLocked prevents records from entering an expired period.
 func (w *Writer) openExistingOrNewLocked() error {
 	info, err := os.Stat(w.filename)
 	if os.IsNotExist(err) {
@@ -245,9 +272,7 @@ func (w *Writer) openExistingOrNewLocked() error {
 	return nil
 }
 
-// openNewLocked creates the log file, assuming the path is free. prev, when
-// non-nil, is the file just rotated out; the new file inherits its
-// permissions (unless WithFileMode is set) and, on Linux, its owner.
+// openNewLocked preserves the previous file's mode and, on Linux, owner.
 func (w *Writer) openNewLocked(prev os.FileInfo) error {
 	if err := os.MkdirAll(w.dir, dirMode); err != nil {
 		return fmt.Errorf("logrotate: create log directory: %w", err)
@@ -270,7 +295,7 @@ func (w *Writer) openNewLocked(prev os.FileInfo) error {
 	}
 	if prev != nil {
 		if err := chown(w.filename, prev); err != nil {
-			w.cfg.reportError(fmt.Errorf("logrotate: preserve log file owner: %w", err))
+			w.reportError(fmt.Errorf("logrotate: preserve log file owner: %w", err))
 		}
 	}
 

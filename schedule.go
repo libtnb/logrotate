@@ -12,11 +12,30 @@ type dayTime struct {
 	hour, min int
 }
 
+// nextRotation returns the earliest time-based rotation boundary strictly
+// after t, or the zero time when no time-based rotation is configured.
+func (c *config) nextRotation(t time.Time) time.Time {
+	loc := c.location()
+	t = t.In(loc)
+	var next time.Time
+	if c.rotateEvery > 0 {
+		next = nextInterval(t, c.rotateEvery, loc)
+	}
+	if len(c.rotateAt) > 0 {
+		at := nextDayTime(t, c.rotateAt, loc)
+		if next.IsZero() || at.Before(next) {
+			next = at
+		}
+	}
+	return next
+}
+
 func parseDayTime(s string) (dayTime, error) {
 	h, m, ok := strings.Cut(s, ":")
 	hour, okH := parseTwoDigits(h)
 	min, okM := parseTwoDigits(m)
-	if !ok || !okH || !okM || hour > 23 || min > 59 {
+	validTime := ok && okH && okM && hour <= 23 && min <= 59
+	if !validTime {
 		return dayTime{}, fmt.Errorf("logrotate: invalid rotate-at time %q, want \"HH:MM\"", s)
 	}
 	return dayTime{hour: hour, min: min}, nil
@@ -43,36 +62,19 @@ func compareDayTime(a, b dayTime) int {
 	return cmp.Compare(a.min, b.min)
 }
 
-// nextRotation returns the earliest time-based rotation boundary strictly
-// after t, or the zero time when no time-based rotation is configured.
-func (c *config) nextRotation(t time.Time) time.Time {
-	loc := c.location()
-	t = t.In(loc)
-	var next time.Time
-	if c.rotateEvery > 0 {
-		next = nextInterval(t, c.rotateEvery, loc)
-	}
-	if len(c.rotateAt) > 0 {
-		at := nextDayTime(t, c.rotateAt, loc)
-		if next.IsZero() || at.Before(next) {
-			next = at
-		}
-	}
-	return next
-}
-
-// nextInterval anchors interval boundaries at midnight in loc so that every
-// day repeats the same boundary sequence (midnight, d, 2d, ...) regardless of
-// process restarts. When d does not divide the day evenly the sequence is
-// capped at the following midnight, shortening the last interval.
-//
-// The day's final boundary is always the calendar midnight, not "midnight
-// plus 24h of elapsed time": on a DST fall-back day (25 wall-clock hours)
-// daily rotation still happens at the next local midnight. Intermediate
-// sub-day boundaries keep even elapsed spacing, so their wall-clock labels
-// can shift by the DST offset for the remainder of a transition day.
+// nextInterval anchors at local midnight. The next calendar midnight caps the
+// final interval, so daily rotation remains correct across DST transitions.
 func nextInterval(t time.Time, d time.Duration, loc *time.Location) time.Time {
-	midnight := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, loc)
+	midnight := time.Date(
+		t.Year(),
+		t.Month(),
+		t.Day(),
+		0,
+		0,
+		0,
+		0,
+		loc,
+	)
 	k := t.Sub(midnight)/d + 1
 	next := midnight.Add(time.Duration(k) * d)
 	nextMidnight := midnight.AddDate(0, 0, 1)
@@ -86,11 +88,29 @@ func nextInterval(t time.Time, d time.Duration, loc *time.Location) time.Time {
 // t, rolling over to the first one on the next day.
 func nextDayTime(t time.Time, times []dayTime, loc *time.Location) time.Time {
 	for _, dt := range times {
-		cand := time.Date(t.Year(), t.Month(), t.Day(), dt.hour, dt.min, 0, 0, loc)
-		if cand.After(t) {
-			return cand
+		candidate := time.Date(
+			t.Year(),
+			t.Month(),
+			t.Day(),
+			dt.hour,
+			dt.min,
+			0,
+			0,
+			loc,
+		)
+		if candidate.After(t) {
+			return candidate
 		}
 	}
 	next := t.AddDate(0, 0, 1)
-	return time.Date(next.Year(), next.Month(), next.Day(), times[0].hour, times[0].min, 0, 0, loc)
+	return time.Date(
+		next.Year(),
+		next.Month(),
+		next.Day(),
+		times[0].hour,
+		times[0].min,
+		0,
+		0,
+		loc,
+	)
 }

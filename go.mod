@@ -1,3 +1,3 @@
 module github.com/libtnb/logrotate
 
-go 1.25.0
+go 1.27rc2

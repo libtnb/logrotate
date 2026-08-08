@@ -2,6 +2,7 @@ package logrotate
 
 import (
 	"compress/gzip"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -12,15 +13,10 @@ import (
 // final name.
 const tmpSuffix = ".tmp"
 
-// Compressor compresses rotated backups. Implementations are invoked from a
-// single background goroutine, one file at a time.
-//
-// The interface is deliberately stream-based so third-party algorithms plug
-// in without this package depending on them; see the package example for a
-// zstd adapter.
+// Compressor transforms backups serially on the maintenance goroutine.
 type Compressor interface {
-	// Compress reads src to EOF and writes the compressed form to dst.
-	Compress(dst io.Writer, src io.Reader) error
+	// Compress writes the compressed src to dst and should honor ctx promptly.
+	Compress(ctx context.Context, dst io.Writer, src io.Reader) error
 	// Extension is the suffix appended to compressed backups, e.g. ".gz".
 	// It must start with a dot.
 	Extension() string
@@ -33,7 +29,7 @@ type GzipCompressor struct {
 	Level int
 }
 
-func (g GzipCompressor) Compress(dst io.Writer, src io.Reader) error {
+func (g GzipCompressor) Compress(ctx context.Context, dst io.Writer, src io.Reader) error {
 	level := g.Level
 	if level == 0 {
 		level = gzip.DefaultCompression
@@ -42,7 +38,7 @@ func (g GzipCompressor) Compress(dst io.Writer, src io.Reader) error {
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(zw, src); err != nil {
+	if _, err := io.Copy(zw, contextReader{ctx: ctx, reader: src}); err != nil {
 		_ = zw.Close()
 		return err
 	}
@@ -51,11 +47,30 @@ func (g GzipCompressor) Compress(dst io.Writer, src io.Reader) error {
 
 func (GzipCompressor) Extension() string { return ".gz" }
 
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, context.Cause(r.ctx)
+	}
+	n, err := r.reader.Read(p)
+	if contextErr := r.ctx.Err(); contextErr != nil {
+		return n, context.Cause(r.ctx)
+	}
+	return n, err
+}
+
 // compressFile compresses src into dst and removes src, returning the size of
 // dst. The archive is staged at dst+".tmp", synced, and renamed into place. A
 // pre-existing non-empty dst means an earlier pass was interrupted after the
 // rename; src is then simply removed.
-func (w *Writer) compressFile(src, dst string) (int64, error) {
+func (w *Writer) compressFile(ctx context.Context, src, dst string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, context.Cause(ctx)
+	}
 	if info, err := os.Stat(dst); err == nil && info.Size() > 0 {
 		if err := os.Remove(src); err != nil {
 			return 0, fmt.Errorf("logrotate: remove backup after compression: %w", err)
@@ -86,7 +101,7 @@ func (w *Writer) compressFile(src, dst string) (int64, error) {
 	if err := out.Chmod(srcInfo.Mode().Perm()); err != nil {
 		return discard(fmt.Errorf("logrotate: set archive mode: %w", err))
 	}
-	if err := w.cfg.compressor.Compress(out, in); err != nil {
+	if err := w.cfg.compressor.Compress(ctx, out, in); err != nil {
 		return discard(fmt.Errorf("logrotate: compress backup: %w", err))
 	}
 	if err := out.Sync(); err != nil {
@@ -97,7 +112,7 @@ func (w *Writer) compressFile(src, dst string) (int64, error) {
 		return 0, fmt.Errorf("logrotate: close archive: %w", err)
 	}
 	if err := chown(tmp, srcInfo); err != nil {
-		w.cfg.reportError(fmt.Errorf("logrotate: preserve archive owner: %w", err))
+		w.reportError(fmt.Errorf("logrotate: preserve archive owner: %w", err))
 	}
 	if err := os.Rename(tmp, dst); err != nil {
 		_ = os.Remove(tmp)

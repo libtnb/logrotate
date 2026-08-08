@@ -1,6 +1,8 @@
 package logrotate
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,9 +20,17 @@ func (w *Writer) requestMill() {
 }
 
 func (w *Writer) millLoop() {
-	defer w.millWG.Done()
-	for range w.millCh {
-		w.millOnce()
+	defer close(w.millDone)
+	for {
+		select {
+		case <-w.millCtx.Done():
+			return
+		case _, ok := <-w.millCh:
+			if !ok {
+				return
+			}
+			w.millOnce(w.millCtx)
+		}
 	}
 }
 
@@ -29,25 +39,34 @@ func (w *Writer) millLoop() {
 // and finally enforces the total-size cap using post-compression sizes.
 // Failures are reported to the error handler and skip only the affected file,
 // so one bad backup cannot stall maintenance forever.
-func (w *Writer) millOnce() {
+func (w *Writer) millOnce(ctx context.Context) {
 	defer func() {
 		if v := recover(); v != nil {
-			w.cfg.reportError(fmt.Errorf("logrotate: maintenance panic: %v", v))
+			w.reportError(fmt.Errorf("logrotate: maintenance panic: %v", v))
 		}
 	}()
+	if err := ctx.Err(); err != nil {
+		return
+	}
 
 	backups, orphans, err := w.listBackups()
 	if err != nil {
-		w.cfg.reportError(err)
+		w.reportError(err)
 		return
 	}
 	for _, name := range orphans {
+		if ctx.Err() != nil {
+			return
+		}
 		w.removeFile(name)
 	}
 
 	keep := backups[:0]
 	cutoff := w.cfg.clock.Now().Add(-w.cfg.maxAge)
 	for i, b := range backups {
+		if ctx.Err() != nil {
+			return
+		}
 		switch {
 		case w.cfg.maxBackups > 0 && i >= w.cfg.maxBackups,
 			w.cfg.maxAge > 0 && b.stamp.Before(cutoff):
@@ -61,6 +80,9 @@ func (w *Writer) millOnce() {
 	if w.cfg.compressor != nil {
 		ext := w.cfg.compressor.Extension()
 		for _, b := range backups {
+			if ctx.Err() != nil {
+				return
+			}
 			if b.compressed() {
 				// Finish an interrupted pass: drop a plain file whose archive
 				// already exists.
@@ -74,9 +96,12 @@ func (w *Writer) millOnce() {
 				continue
 			}
 			src := filepath.Join(w.dir, b.files[0].name)
-			size, err := w.compressFile(src, src+ext)
+			size, err := w.compressFile(ctx, src, src+ext)
 			if err != nil {
-				w.cfg.reportError(err)
+				if ctx.Err() != nil && errors.Is(err, context.Cause(ctx)) {
+					return
+				}
+				w.reportError(err)
 				continue
 			}
 			b.files = []backupFile{{name: b.files[0].name + ext, size: size, compressed: true}}
@@ -86,6 +111,9 @@ func (w *Writer) millOnce() {
 	if w.cfg.maxTotalSize > 0 {
 		var total int64
 		for _, b := range backups {
+			if ctx.Err() != nil {
+				return
+			}
 			total += b.size()
 			if total > w.cfg.maxTotalSize {
 				w.removeBackup(b)
@@ -102,6 +130,6 @@ func (w *Writer) removeBackup(b *backup) {
 
 func (w *Writer) removeFile(name string) {
 	if err := os.Remove(filepath.Join(w.dir, name)); err != nil && !os.IsNotExist(err) {
-		w.cfg.reportError(fmt.Errorf("logrotate: remove old backup: %w", err))
+		w.reportError(fmt.Errorf("logrotate: remove old backup: %w", err))
 	}
 }

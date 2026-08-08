@@ -48,7 +48,16 @@ func (w *Writer) backupName(t time.Time) string {
 	ts := t.In(w.cfg.location()).Format(w.cfg.timeFormat)
 	name := filepath.Join(w.dir, w.prefix+ts+w.ext)
 	for seq := 1; w.backupExists(name); seq++ {
-		name = filepath.Join(w.dir, fmt.Sprintf("%s%s.%d%s", w.prefix, ts, seq, w.ext))
+		name = filepath.Join(
+			w.dir,
+			fmt.Sprintf(
+				"%s%s.%d%s",
+				w.prefix,
+				ts,
+				seq,
+				w.ext,
+			),
+		)
 	}
 	return name
 }
@@ -73,7 +82,7 @@ func (w *Writer) backupExists(name string) bool {
 // listBackups scans the log directory and returns our backups sorted newest
 // first, together with the names of orphaned temporary files left behind by
 // an interrupted compression.
-func (w *Writer) listBackups() (backups []*backup, orphans []string, err error) {
+func (w *Writer) listBackups() ([]*backup, []string, error) {
 	entries, err := os.ReadDir(w.dir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("logrotate: read log directory: %w", err)
@@ -83,6 +92,8 @@ func (w *Writer) listBackups() (backups []*backup, orphans []string, err error) 
 		unix int64
 		seq  int
 	}
+	var backups []*backup
+	var orphans []string
 	byStamp := make(map[key]*backup)
 	for _, entry := range entries {
 		if entry.IsDir() {
@@ -103,7 +114,7 @@ func (w *Writer) listBackups() (backups []*backup, orphans []string, err error) 
 		if err != nil {
 			continue // vanished between ReadDir and Info
 		}
-		k := key{stamp.UnixNano(), seq}
+		k := key{unix: stamp.UnixNano(), seq: seq}
 		b := byStamp[k]
 		if b == nil {
 			b = &backup{stamp: stamp, seq: seq}
