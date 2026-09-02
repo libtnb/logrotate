@@ -13,22 +13,44 @@ import (
 // final name.
 const tmpSuffix = ".tmp"
 
-// Compressor transforms backups serially on the maintenance goroutine.
+// Compressor turns a plain backup into an archive. The Writer calls Compress
+// once per backup, serially on the maintenance goroutine, with dst being a
+// staging file that is synced and renamed into place when Compress returns
+// nil, after which the plain backup is deleted; Compress must therefore
+// return an error whenever dst is incomplete. It should return promptly once
+// ctx is done, with an error wrapping context.Cause(ctx): such an error ends
+// the maintenance pass quietly, whereas any other error is retained as a
+// compression failure and reported to the error handler. In both cases the
+// plain backup is kept and retried on a later pass. A Compressor that ignores
+// ctx makes a Shutdown deadline abandon the wait while the maintenance
+// goroutine keeps running until Compress returns.
 type Compressor interface {
-	// Compress writes the compressed src to dst and should honor ctx promptly.
+	// Compress writes the complete archive of src to dst, honoring ctx as
+	// described for the interface.
 	Compress(ctx context.Context, dst io.Writer, src io.Reader) error
-	// Extension is the suffix appended to compressed backups, e.g. ".gz".
-	// It must start with a dot.
+	// Extension is the suffix appended to archive names, for example ".gz".
+	// It must start with a dot, be at least two characters long, differ from
+	// ".tmp" and contain no path separator; New rejects other values. It must
+	// not change during the life of the Writer, which uses it both to name
+	// new archives and to recognise existing ones.
 	Extension() string
 }
 
-// GzipCompressor implements Compressor with compress/gzip.
+// GzipCompressor is the Compressor behind WithCompress, built on
+// compress/gzip. The zero value compresses at gzip.DefaultCompression; set
+// Level to trade ratio for speed, for example gzip.BestSpeed on a busy
+// service.
 type GzipCompressor struct {
 	// Level is a compress/gzip compression level. The zero value selects
-	// gzip.DefaultCompression.
+	// gzip.DefaultCompression, so gzip.NoCompression (0) cannot be requested;
+	// a level outside the gzip range makes Compress fail for every backup.
 	Level int
 }
 
+// Compress gzips src into dst at Level. It checks ctx around every read and
+// returns context.Cause(ctx) once ctx is done, leaving dst incomplete, so a
+// Shutdown deadline interrupts a large archive promptly. Other errors come
+// from gzip, for an invalid Level, or from the underlying reads and writes.
 func (g GzipCompressor) Compress(ctx context.Context, dst io.Writer, src io.Reader) error {
 	level := g.Level
 	if level == 0 {
@@ -45,8 +67,11 @@ func (g GzipCompressor) Compress(ctx context.Context, dst io.Writer, src io.Read
 	return zw.Close()
 }
 
+// Extension returns ".gz".
 func (GzipCompressor) Extension() string { return ".gz" }
 
+// contextReader fails a read once ctx is done, so that an io.Copy driven by a
+// compressor stops between chunks instead of running to the end of src.
 type contextReader struct {
 	ctx    context.Context
 	reader io.Reader

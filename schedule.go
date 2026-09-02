@@ -7,29 +7,23 @@ import (
 	"time"
 )
 
+// Time-based rotation uses boundaries computed in the configured zone. The
+// interval schedule divides each local day from midnight into slots of the
+// interval length, measured in elapsed time; the slot that would run past the
+// next midnight is cut there, so a 24h interval means calendar midnight even
+// on a 23- or 25-hour daylight-saving day, and sub-day intervals keep even
+// elapsed spacing through the transition. The rotate-at schedule takes the
+// earliest configured time of day still ahead, or the first one tomorrow.
+// With both configured the earlier boundary wins. Every boundary is strictly
+// after the reference time, so a write exactly on a boundary rotates once.
+
 // dayTime is a wall-clock time of day used by WithRotateAt.
 type dayTime struct {
 	hour, min int
 }
 
-// nextRotation returns the earliest time-based rotation boundary strictly
-// after t, or the zero time when no time-based rotation is configured.
-func (c *config) nextRotation(t time.Time) time.Time {
-	loc := c.location()
-	t = t.In(loc)
-	var next time.Time
-	if c.rotateEvery > 0 {
-		next = nextInterval(t, c.rotateEvery, loc)
-	}
-	if len(c.rotateAt) > 0 {
-		at := nextDayTime(t, c.rotateAt, loc)
-		if next.IsZero() || at.Before(next) {
-			next = at
-		}
-	}
-	return next
-}
-
+// parseDayTime accepts "HH:MM" with one or two digits per field and rejects
+// anything else, including signs, spaces and seconds.
 func parseDayTime(s string) (dayTime, error) {
 	h, m, ok := strings.Cut(s, ":")
 	hour, okH := parseTwoDigits(h)
@@ -41,6 +35,8 @@ func parseDayTime(s string) (dayTime, error) {
 	return dayTime{hour: hour, min: min}, nil
 }
 
+// parseTwoDigits parses one or two ASCII digits; strconv would also accept
+// signs, underscores and longer input.
 func parseTwoDigits(s string) (int, bool) {
 	if len(s) < 1 || len(s) > 2 {
 		return 0, false
@@ -60,6 +56,24 @@ func compareDayTime(a, b dayTime) int {
 		return cmp.Compare(a.hour, b.hour)
 	}
 	return cmp.Compare(a.min, b.min)
+}
+
+// nextRotation returns the earliest time-based rotation boundary strictly
+// after t, or the zero time when no time-based rotation is configured.
+func (c *config) nextRotation(t time.Time) time.Time {
+	loc := c.location()
+	t = t.In(loc)
+	var next time.Time
+	if c.rotateEvery > 0 {
+		next = nextInterval(t, c.rotateEvery, loc)
+	}
+	if len(c.rotateAt) > 0 {
+		at := nextDayTime(t, c.rotateAt, loc)
+		if next.IsZero() || at.Before(next) {
+			next = at
+		}
+	}
+	return next
 }
 
 // nextInterval anchors at local midnight. The next calendar midnight caps the

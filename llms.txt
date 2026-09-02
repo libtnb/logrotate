@@ -1,0 +1,145 @@
+# logrotate
+
+> Rotating log file writer for Go: size- and time-based rotation, background compression and retention, standard library only.
+
+## Overview
+
+github.com/libtnb/logrotate provides `Writer`, an `io.WriteCloser` that appends to one log file at a fixed path and moves it aside as a timestamped backup when a size limit or a wall-clock boundary is reached. Backups are compressed and pruned on a maintenance goroutine so writes never wait for maintenance; maintenance failures are retained and returned by `Close` or `Shutdown`. It is for services that write their own log files and want rotation without an external tool, and it cooperates with one through `Reopen`.
+
+## Quick Start
+
+```bash
+go get github.com/libtnb/logrotate
+```
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	"github.com/libtnb/logrotate"
+)
+
+func main() {
+	w, err := logrotate.New("/var/log/myapp/app.log",
+		logrotate.WithMaxSize(64*logrotate.MB),
+		logrotate.WithRotateEvery(24*time.Hour),
+		logrotate.WithMaxBackups(14),
+		logrotate.WithCompress(),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		if err := w.Close(); err != nil {
+			fmt.Fprintln(os.Stderr, "log maintenance:", err)
+		}
+	}()
+
+	log.SetOutput(w)
+	log.Println("application started")
+}
+```
+
+## Key Concepts
+
+- **Write-driven rotation**: rotation happens inside `Write`, under the write lock. A record that would push the file past `WithMaxSize` (default 100 MB) goes into a fresh file; a record that fills the file triggers an immediate rotation; a record larger than the limit is written in full and rotated out alone. Records are never split.
+- **Wall-clock boundaries**: `WithRotateEvery` (1s to 24h, anchored at midnight in the `WithLocation` zone, last interval cut at the next midnight) and `WithRotateAt` ("HH:MM") are evaluated on writes only: the first write at or after a boundary rotates first, idle periods produce no empty backups, and the backup carries the boundary time. `New` rotates an existing file whose modification time falls in an ended period.
+- **Backup names**: `app.log` rotates to `app-2026-03-14T10-30-00.000.log` (layout from `WithBackupTimeFormat`, zone from `WithLocation`). A reused timestamp gets a sequence suffix, `app-<stamp>.1.log`, `app-<stamp>.2.log`; sequences only grow, one past the highest on disk, so the newest backup sorts last and nothing is overwritten. Compressed archives append the compressor extension, e.g. `.gz`. Non-matching files are never removed.
+- **Retention order**: each maintenance pass (requested by `New` and by every rotation) sorts backups newest first, removes orphaned `.tmp` archives, applies `WithMaxBackups` and `WithMaxAge` (measured from the backup timestamp against the `Clock`), compresses the survivors, then applies `WithMaxTotalSize` to on-disk sizes (active file excluded). Zero disables a limit.
+- **Compression**: `WithCompress` (gzip) or `WithCompressor` (custom). Archives are staged as `.tmp`, synced and renamed before the plain backup is removed; a failed compression keeps the plain backup and retries on the next pass.
+- **Shutdown and errors**: `Close`/`Shutdown` close the file (later calls return `ErrClosed`), wait for maintenance, and return the close error joined with a bounded record of maintenance errors (first, most recent, count omitted). `Shutdown` stops waiting at its deadline and cancels the in-flight compression. `WithErrorHandler` is an advisory live feed of the same errors.
+- **Clock**: `WithClock` replaces `time.Now` for schedules, names and age retention; implementations must be safe for concurrent use.
+
+## API Reference
+
+### Core Functions
+
+- `New(filename string, opts ...Option) (*Writer, error)` - opens `filename` for append (creating parent directories), validates all options, rotates a stale file, starts the maintenance goroutine. Returns a descriptive error for invalid options, a nil option, an empty name or a non-regular file.
+- `(*Writer) Write(p []byte) (int, error)` - appends one record, rotating first when due. Returns `ErrClosed` after shutdown; a failed pre-write rotation returns its error and writes nothing.
+- `(*Writer) Close() error` - `Shutdown(context.Background())`.
+- `(*Writer) Shutdown(ctx context.Context) error` - closes the file, waits for maintenance until `ctx` ends, returns the joined error record; idempotent.
+- `(*Writer) Rotate() error` - forces a rotation stamped with the current time; an empty file produces no backup.
+- `(*Writer) Reopen() error` - closes and reopens the path without renaming, for external rotators.
+- `(*Writer) Sync() error` - flushes the active file; satisfies `zapcore.WriteSyncer`.
+- `(*Writer) Filename() string` - the cleaned active path.
+- `WithMaxSize(n int64)`, `WithMaxBackups(n int)`, `WithMaxAge(d time.Duration)`, `WithMaxTotalSize(n int64)` - limits; zero disables; negative rejected by `New`.
+- `WithRotateEvery(d time.Duration)`, `WithRotateAt(times ...string)` - wall-clock schedules.
+- `WithCompress()`, `WithCompressor(c Compressor)` - compression.
+- `WithLocation(loc *time.Location)`, `WithBackupTimeFormat(layout string)`, `WithFileMode(mode fs.FileMode)` - zone, name layout, exact permission bits.
+- `WithErrorHandler(fn func(error))`, `WithClock(c Clock)` - notifications and time source.
+
+### Core Types
+
+- `Writer` - the rotating file; safe for concurrent use; assumes a single process owns the path (no file lock).
+- `Option` - `func(*config)` applied in order by `New`.
+- `Compressor` - `Compress(ctx, dst, src) error` and `Extension() string`; must return an error when `dst` is incomplete, should stop with an error wrapping `context.Cause(ctx)` when `ctx` is done.
+- `GzipCompressor` - built-in `Compressor`; `Level` 0 means `gzip.DefaultCompression`.
+- `Clock` - `Now() time.Time`; concurrency-safe replacement for `time.Now`.
+- `KB`, `MB`, `GB` - binary byte units; `Day` - `24 * time.Hour`.
+
+## Common Patterns
+
+### Rotate on SIGHUP
+
+```go
+hup := make(chan os.Signal, 1)
+signal.Notify(hup, syscall.SIGHUP)
+go func() {
+	for range hup {
+		if err := w.Rotate(); err != nil {
+			fmt.Fprintln(os.Stderr, "rotate:", err)
+		}
+	}
+}()
+```
+
+### Delegate rotation to logrotate(8)
+
+```go
+w, err := logrotate.New("/var/log/myapp/app.log", logrotate.WithMaxSize(0))
+// on SIGUSR1 after the tool moved the file:
+if err := w.Reopen(); err != nil {
+	fmt.Fprintln(os.Stderr, "reopen:", err)
+}
+```
+
+### Bounded shutdown
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+if err := w.Shutdown(ctx); err != nil {
+	fmt.Fprintln(os.Stderr, "log shutdown:", err)
+}
+```
+
+### Deterministic tests
+
+```go
+type fixedClock time.Time
+
+func (c fixedClock) Now() time.Time { return time.Time(c) }
+
+w, err := logrotate.New(filepath.Join(t.TempDir(), "app.log"),
+	logrotate.WithClock(fixedClock(time.Date(2026, 3, 14, 10, 30, 0, 0, time.UTC))),
+)
+```
+
+## Error Handling
+
+- `ErrClosed` - returned unwrapped by `Write`, `Sync`, `Rotate` and `Reopen` after `Close` or `Shutdown`; compare with `errors.Is`. A closed Writer cannot be reopened.
+- Errors from `New` - descriptive, non-sentinel: invalid option values (negative limit, interval outside [1s, 24h], malformed `HH:MM`, layout that does not round-trip or contains a path separator, non-permission mode bits, nil location or clock, typed-nil or invalid-extension compressor), a nil option, an empty file name, a non-regular file, or a directory or file that cannot be created, opened or rotated.
+- Errors from `Close` and `Shutdown` - the file close error joined with retained maintenance errors (compression, listing or removing backups, ownership preservation, rotations that failed after a successful write) and, for `Shutdown`, the context cause when the deadline passed. Nil means a clean close with no maintenance error ever reported.
+- `WithErrorHandler` - advisory notifications of the same errors; overflow is dropped and summarised as one "error handler notifications omitted" error.
+
+## References
+
+- Documentation: https://pkg.go.dev/github.com/libtnb/logrotate
+- Repository: https://github.com/libtnb/logrotate
+- Go Reference: https://pkg.go.dev/github.com/libtnb/logrotate
+- Issues: https://github.com/libtnb/logrotate/issues

@@ -1,6 +1,8 @@
 package logrotate_test
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"log/slog"
 	"os"
@@ -77,4 +79,93 @@ func ExampleWithCompressor() {
 		log.Fatal(err)
 	}
 	defer func() { _ = w.Close() }()
+}
+
+// fixedClock pins the wall time so that backup names are predictable. An
+// immutable value is trivially safe for concurrent use, as Clock requires.
+type fixedClock time.Time
+
+func (c fixedClock) Now() time.Time { return time.Time(c) }
+
+// Pin the clock in tests: backup names then follow from the configuration
+// alone, and rotations that share a timestamp are told apart by a sequence
+// suffix.
+func ExampleWithClock() {
+	dir, err := os.MkdirTemp("", "logrotate-example")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	clock := fixedClock(time.Date(2026, 3, 14, 10, 30, 0, 0, time.UTC))
+	w, err := logrotate.New(filepath.Join(dir, "app.log"), logrotate.WithClock(clock))
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, line := range []string{"first\n", "second\n"} {
+		if _, err := w.Write([]byte(line)); err != nil {
+			log.Fatal(err)
+		}
+		if err := w.Rotate(); err != nil {
+			log.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		log.Fatal(err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, entry := range entries {
+		fmt.Println(entry.Name())
+	}
+	// Output:
+	// app-2026-03-14T10-30-00.000.1.log
+	// app-2026-03-14T10-30-00.000.log
+	// app.log
+}
+
+// Bound the wait for background compression at shutdown. A deadline that
+// passes cancels the compression in flight and is joined into the result; a
+// later Close waits for the maintenance goroutine to exit.
+func ExampleWriter_Shutdown() {
+	dir, err := os.MkdirTemp("", "logrotate-example")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	clock := fixedClock(time.Date(2026, 3, 14, 10, 30, 0, 0, time.UTC))
+	w, err := logrotate.New(filepath.Join(dir, "app.log"),
+		logrotate.WithClock(clock),
+		logrotate.WithCompress(),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if _, err := w.Write([]byte("rotated and compressed\n")); err != nil {
+		log.Fatal(err)
+	}
+	if err := w.Rotate(); err != nil {
+		log.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := w.Shutdown(ctx); err != nil {
+		log.Fatal(err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, entry := range entries {
+		fmt.Println(entry.Name())
+	}
+	// Output:
+	// app-2026-03-14T10-30-00.000.log.gz
+	// app.log
 }

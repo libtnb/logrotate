@@ -790,13 +790,33 @@ func TestMaxTotalSizeEnforcedWhenCompressionFails(t *testing.T) {
 	}
 }
 
+// waitBackups polls until retention has left exactly want backups, without
+// closing the writer.
+func waitBackups(t *testing.T, path string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		names := listDir(t, path)
+		if len(names) == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("backups = %v, want %d", names, want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestCustomBackupTimeFormat(t *testing.T) {
 	w, path, _ := newTestWriter(t, WithBackupTimeFormat("2006-01-02"), WithMaxBackups(2))
-	for _, s := range []string{"one", "two", "three"} {
+	// Four rotations on one day: after the third, retention has deleted the
+	// bare name; the fourth must not reuse it and then be treated as oldest.
+	for i, s := range []string{"one", "two", "three", "four"} {
 		mustWrite(t, w, s)
 		if err := w.Rotate(); err != nil {
 			t.Fatal(err)
 		}
+		waitBackups(t, path, min(i+1, 2))
 	}
 	drainMill(t, w)
 
@@ -806,8 +826,43 @@ func TestCustomBackupTimeFormat(t *testing.T) {
 	}
 	dir := filepath.Dir(path)
 	got := readFile(t, filepath.Join(dir, names[0])) + "," + readFile(t, filepath.Join(dir, names[1]))
-	if got != "two,three" {
-		t.Errorf("survivors = %q, want the two newest by sequence", got)
+	if got != "three,four" {
+		t.Errorf("survivors = %q, want the two newest by sequence (files: %v)", got, names)
+	}
+}
+
+func TestSequenceContinuesPastRetentionGaps(t *testing.T) {
+	w, path, _ := newTestWriter(t, WithBackupTimeFormat("2006-01-02"), WithMaxBackups(1))
+	for _, s := range []string{"one", "two", "three"} {
+		mustWrite(t, w, s)
+		if err := w.Rotate(); err != nil {
+			t.Fatal(err)
+		}
+		waitBackups(t, path, 1)
+	}
+	drainMill(t, w)
+	if names := listDir(t, path); len(names) != 1 || !strings.HasSuffix(names[0], ".2.log") {
+		t.Fatalf("backups = %v, want only the .2 sequence", names)
+	}
+
+	// A fresh Writer (a restarted process) must continue past the highest
+	// sequence on disk instead of reusing the freed bare name.
+	w2, err := New(path, WithBackupTimeFormat("2006-01-02"), WithMaxBackups(1),
+		WithClock(newFakeClock(baseTime)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, w2, "four")
+	if err := w2.Rotate(); err != nil {
+		t.Fatal(err)
+	}
+	drainMill(t, w2)
+	names := listDir(t, path)
+	if len(names) != 1 || !strings.HasSuffix(names[0], ".3.log") {
+		t.Fatalf("backups after restart = %v, want only the .3 sequence", names)
+	}
+	if got := readFile(t, filepath.Join(filepath.Dir(path), names[0])); got != "four" {
+		t.Fatalf("survivor = %q, want the newest backup", got)
 	}
 }
 
@@ -868,7 +923,7 @@ func TestCloseIdempotentAndWriteAfterClose(t *testing.T) {
 
 func TestShutdownRejectsNilContext(t *testing.T) {
 	w, _, _ := newTestWriter(t)
-	if err := w.Shutdown(nil); err == nil {
+	if err := w.Shutdown(nil); err == nil { //nolint:staticcheck // a nil Context is the input under test
 		t.Fatal("Shutdown(nil) succeeded")
 	}
 }
