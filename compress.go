@@ -90,14 +90,15 @@ func (r contextReader) Read(p []byte) (int, error) {
 
 // compressFile compresses src into dst and removes src, returning the size of
 // dst. The archive is staged at dst+".tmp", synced, and renamed into place. A
-// pre-existing non-empty dst means an earlier pass was interrupted after the
-// rename; src is then simply removed.
+// non-empty dst means another pass already published it, possibly from a
+// second process sharing the log during a handoff; src is then simply removed,
+// and a src that is already gone counts as done too.
 func (w *Writer) compressFile(ctx context.Context, src, dst string) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, context.Cause(ctx)
 	}
 	if info, err := os.Stat(dst); err == nil && info.Size() > 0 {
-		if err := os.Remove(src); err != nil {
+		if err := os.Remove(src); err != nil && !os.IsNotExist(err) {
 			return 0, fmt.Errorf("logrotate: remove backup after compression: %w", err)
 		}
 		return info.Size(), nil
@@ -136,16 +137,19 @@ func (w *Writer) compressFile(ctx context.Context, src, dst string) (int64, erro
 		_ = os.Remove(tmp)
 		return 0, fmt.Errorf("logrotate: close archive: %w", err)
 	}
-	if err := chown(tmp, srcInfo); err != nil {
+	if err := chown(tmp, srcInfo); err != nil && !os.IsNotExist(err) {
 		w.reportError(fmt.Errorf("logrotate: preserve archive owner: %w", err))
 	}
 	if err := os.Rename(tmp, dst); err != nil {
 		_ = os.Remove(tmp)
-		return 0, fmt.Errorf("logrotate: publish archive: %w", err)
+		// another process sharing the log may have published this archive first
+		if info, statErr := os.Stat(dst); !os.IsNotExist(err) || statErr != nil || info.Size() == 0 {
+			return 0, fmt.Errorf("logrotate: publish archive: %w", err)
+		}
 	}
 
 	_ = in.Close() // Windows cannot remove an open file
-	if err := os.Remove(src); err != nil {
+	if err := os.Remove(src); err != nil && !os.IsNotExist(err) {
 		return 0, fmt.Errorf("logrotate: remove backup after compression: %w", err)
 	}
 	info, err := os.Stat(dst)

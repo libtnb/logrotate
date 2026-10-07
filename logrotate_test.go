@@ -635,6 +635,54 @@ type extCompressor struct {
 
 func (c extCompressor) Extension() string { return c.ext }
 
+// publishingCompressor stands in for a second process that finishes the same
+// archive first: it renames the staged ".tmp" into place and removes the
+// backup before compressFile gets to.
+type publishingCompressor struct{}
+
+func (publishingCompressor) Compress(ctx context.Context, out io.Writer, in io.Reader) error {
+	if err := (GzipCompressor{}).Compress(ctx, out, in); err != nil {
+		return err
+	}
+	f, ok := out.(*os.File)
+	if !ok {
+		return nil
+	}
+	_ = f.Sync()
+	if err := os.Rename(f.Name(), strings.TrimSuffix(f.Name(), tmpSuffix)); err != nil {
+		return err
+	}
+	dir := filepath.Dir(f.Name())
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if name := e.Name(); strings.HasSuffix(name, ".log") && strings.Contains(name, "-") {
+			_ = os.Remove(filepath.Join(dir, name))
+		}
+	}
+	return nil
+}
+
+func (publishingCompressor) Extension() string { return ".gz" }
+
+func TestCompressToleratesAnotherPublisher(t *testing.T) {
+	w, path, _ := newTestWriter(t, WithCompressor(publishingCompressor{}))
+	mustWrite(t, w, "shared")
+	if err := w.Rotate(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close error = %v, want none when another publisher won the rename", err)
+	}
+	names := listDir(t, path)
+	if len(names) != 1 || !strings.HasSuffix(names[0], ".log.gz") {
+		t.Errorf("backups = %v, want the one published archive", names)
+	}
+}
+
 type failingCompressor struct{}
 
 func (failingCompressor) Compress(context.Context, io.Writer, io.Reader) error {
